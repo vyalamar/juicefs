@@ -653,3 +653,44 @@ Targeted log:
   - Concurrent writes/truncate usually mutate inode attrs and are caught by WATCH retry.
   - Chunk-only maintenance mutations can still race and be cloned from a moving chunk view.
 - This is not unique to batch clone; old per-entry `doCloneEntry` uses the same watch scope (`pkg/meta/redis.go:5058`).
+
+## Concurrency Thought Experiment: Two `Clone` Calls Running at Once
+
+Question analyzed: "If one clone is in progress and another clone starts, what protects correctness?"
+
+### 1) API layer locking model
+
+- There is no global clone mutex in `baseMeta.Clone` (`pkg/meta/base.go:3182`).
+- Concurrency is allowed by design; protection is done by metadata transactions and namespace checks.
+- Redis transactions are wrapped by `m.txn(...)` (`pkg/meta/redis.go:1121`) which uses:
+  - local process slot lock `txLock`/`txUnlock` (`pkg/meta/base.go:622`, `pkg/meta/base.go:626`)
+  - Redis `WATCH` + retry loop (up to 50 tries) (`pkg/meta/redis.go:1145`, `pkg/meta/redis.go:1150`)
+
+### 2) Top-level destination name conflict behavior
+
+- `Clone` does a pre-check `doLookup(parent, name)` and returns `EEXIST` if found (`pkg/meta/base.go:3211`).
+- For directory clone, final visibility happens at attach step `doAttachDirNode` (`pkg/meta/base.go:3232`).
+- `doAttachDirNode` watches parent inode + entry hash (`pkg/meta/redis.go:5453`) and checks `HExists(name)` before `HSet` (`pkg/meta/redis.go:5436`, `pkg/meta/redis.go:5441`).
+- Result: two concurrent directory clones targeting the same destination name should resolve with one success, one `EEXIST` at attach.
+
+### 3) Batch clone phase interaction
+
+- `doBatchClone` runs while cloning children into a destination directory inode (`pkg/meta/redis.go:5074`).
+- It watches destination parent metadata and source inode/xattr keys (`pkg/meta/redis.go:5138`-`pkg/meta/redis.go:5142`).
+- Child writes are done in `TxPipelined` (`pkg/meta/redis.go:5317`), including entry inserts/chunk copy/symlink copy/stats deltas.
+- For standard recursive clone flow, this destination parent is the newly created detached directory, so external clients cannot normally race on those child names before attach.
+
+### 4) What is protected vs not protected
+
+- Protected:
+  - parent attach name collision for directory clones (via `doAttachDirNode` watch+existence check).
+  - source inode/xattr mutation races that touch watched keys (transaction retries).
+- Not fully protected:
+  - source chunk-key-only races (`c{ino}_{idx}` not watched in batch path), documented above.
+  - runtime command errors inside `MULTI/EXEC` can still leave partial writes (Redis does not roll back runtime errors), demonstrated in `TestRedisBatchClonePartialFailureLeavesState`.
+
+### 5) Practical outcome
+
+- Concurrent clones are supported, but safety is transactional/optimistic, not serialized globally.
+- The strongest namespace conflict guard for directory clone destination names is at `doAttachDirNode`.
+- Batch clone keeps old-model caveats for chunk-key watch scope and Redis partial-write semantics under command-level runtime errors.
