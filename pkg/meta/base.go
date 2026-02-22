@@ -97,6 +97,7 @@ type engine interface {
 	doDeleteSlice(id uint64, size uint32) error
 
 	doCloneEntry(ctx Context, srcIno Ino, parent Ino, name string, ino Ino, attr *Attr, cmode uint8, cumask uint16, top bool) syscall.Errno
+	doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entries []*Entry, cmode uint8, cumask uint16, length *int64, space *int64, inodes *int64, userGroupQuotas *[]userGroupQuotaDelta) syscall.Errno
 	doAttachDirNode(ctx Context, parent Ino, dstIno Ino, name string) syscall.Errno
 	doFindDetachedNodes(t time.Time) []Ino
 	doCleanupDetachedNode(ctx Context, detachedNode Ino) syscall.Errno
@@ -1730,6 +1731,28 @@ func (m *baseMeta) BatchUnlink(ctx Context, parent Ino, entries []*Entry, count 
 	return st
 }
 
+func (m *baseMeta) BatchClone(ctx Context, srcParent Ino, dstParent Ino, entries []*Entry, cmode uint8, cumask uint16, count *uint64) syscall.Errno {
+	if len(entries) == 0 {
+		return 0
+	}
+	var length int64
+	var space int64
+	var inodes int64
+	userGroupQuotas := make([]userGroupQuotaDelta, 0, len(entries))
+	st := m.en.doBatchClone(ctx, srcParent, dstParent, entries, cmode, cumask, &length, &space, &inodes, &userGroupQuotas)
+	if st == 0 {
+		m.en.updateStats(space, inodes)
+		m.updateDirQuota(ctx, dstParent, space, inodes)
+		for _, quota := range userGroupQuotas {
+			m.updateUserGroupQuota(ctx, quota.Uid, quota.Gid, quota.Space, quota.Inodes)
+		}
+		if count != nil {
+			atomic.AddUint64(count, uint64(inodes))
+		}
+	}
+	return st
+}
+
 func (m *baseMeta) Rename(ctx Context, parentSrc Ino, nameSrc string, parentDst Ino, nameDst string, flags uint32, inode *Ino, attr *Attr) syscall.Errno {
 	if parentSrc == RootInode && nameSrc == TrashName || parentDst == RootInode && nameDst == TrashName {
 		return syscall.EPERM
@@ -3156,7 +3179,7 @@ func (m *baseMeta) ScanDeletedObject(ctx Context, tss trashSliceScan, pss pendin
 	return eg.Wait()
 }
 
-func (m *baseMeta) Clone(ctx Context, srcParentIno, srcIno, parent Ino, name string, cmode uint8, cumask uint16, count, total *uint64) syscall.Errno {
+func (m *baseMeta) Clone(ctx Context, srcParentIno, srcIno, parent Ino, name string, cmode uint8, cumask uint16, concurrency uint8, count, total *uint64) syscall.Errno {
 
 	if srcIno.IsTrash() || srcParentIno.IsTrash() || parent.IsTrash() || (parent == RootInode && name == TrashName) {
 		return syscall.EPERM
@@ -3199,7 +3222,10 @@ func (m *baseMeta) Clone(ctx Context, srcParentIno, srcIno, parent Ino, name str
 		return err
 	}
 	*total = sum.Dirs + sum.Files
-	concurrent := make(chan struct{}, 4)
+	if concurrency < 1 {
+		concurrency = 1
+	}
+	concurrent := make(chan struct{}, concurrency)
 	if attr.Typ == TypeDirectory {
 		eno = m.cloneEntry(ctx, srcIno, parent, name, &dstIno, cmode, cumask, count, true, concurrent)
 		if eno == 0 {
@@ -3252,9 +3278,9 @@ func (m *baseMeta) cloneEntry(ctx Context, srcIno Ino, parent Ino, name string, 
 	}
 	defer handler.Close()
 
-	var wg sync.WaitGroup
+	var g errgroup.Group
 	var skipped uint32
-	var errCh = make(chan syscall.Errno, cap(concurrent))
+
 	cloneChild := func(e *Entry) syscall.Errno {
 		eno := m.cloneEntry(ctx, e.Inode, ino, string(e.Name), nil, cmode, cumask, count, false, concurrent)
 		if eno == syscall.ENOENT {
@@ -3268,49 +3294,82 @@ func (m *baseMeta) cloneEntry(ctx Context, srcIno Ino, parent Ino, name string, 
 	}
 
 	offset := 0
-LOOP:
 	for {
 		batchEntries, batchEno := handler.List(ctx, offset)
-		if eno = batchEno; batchEno != 0 {
+		if batchEno != 0 {
+			eno = batchEno
 			break
 		}
 		if len(batchEntries) == 0 {
 			break
 		}
 
-		// Process directories first
-		sort.Slice(batchEntries, func(i, j int) bool {
-			return batchEntries[i].Attr.Typ == TypeDirectory
-		})
-
-		for _, entry := range batchEntries {
-			if string(entry.Name) == "." || string(entry.Name) == ".." {
+		var nonDirEntries []*Entry
+		for _, e := range batchEntries {
+			if string(e.Name) == "." || string(e.Name) == ".." {
 				continue
 			}
-			select {
-			case e := <-errCh:
-				eno = e
-				ctx.Cancel()
-				break LOOP
-			case concurrent <- struct{}{}:
-				wg.Add(1)
-				go func(e *Entry) {
-					defer wg.Done()
-					eno := cloneChild(e)
-					if eno != 0 {
-						errCh <- eno
+
+			if e.Attr.Typ == TypeDirectory {
+				select {
+				case concurrent <- struct{}{}:
+					entry := e
+					g.Go(func() error {
+						defer func() { <-concurrent }()
+						if childEno := cloneChild(entry); childEno != 0 {
+							return childEno
+						}
+						return nil
+					})
+				default:
+					// Synchronous fallback when concurrency limit reached
+					if childEno := cloneChild(e); childEno != 0 {
+						eno = childEno
+						break
 					}
-					<-concurrent
-				}(entry)
-			default:
-				if e := cloneChild(entry); e != 0 {
-					eno = e
-					break LOOP
 				}
+			} else {
+				nonDirEntries = append(nonDirEntries, e)
 			}
+
 			if ctx.Canceled() {
 				eno = syscall.EINTR
-				break LOOP
+				break
+			}
+		}
+
+		if eno != 0 {
+			break
+		}
+
+		// Batch clone files immediately (don't wait for subdirs to finish)
+		if len(nonDirEntries) > 0 {
+			if eno = m.BatchClone(ctx, srcIno, ino, nonDirEntries, cmode, cumask, count); eno == syscall.ENOTSUP {
+				// Fallback: clone each file concurrently
+				for _, e := range nonDirEntries {
+					select {
+					case concurrent <- struct{}{}:
+						entry := e
+						g.Go(func() error {
+							defer func() { <-concurrent }()
+							if childEno := cloneChild(entry); childEno != 0 {
+								return childEno
+							}
+							return nil
+						})
+					default:
+						// Synchronous fallback when concurrency limit reached
+						if childEno := cloneChild(e); childEno != 0 {
+							eno = childEno
+							break
+						}
+					}
+				}
+				if eno == syscall.ENOTSUP {
+					eno = 0
+				}
+			} else if eno != 0 {
+				break
 			}
 		}
 
@@ -3320,13 +3379,12 @@ LOOP:
 			break
 		}
 	}
-	wg.Wait()
-	if eno == 0 {
-		select {
-		case eno = <-errCh:
-		default:
-		}
+
+	// Wait for all goroutines and get first error
+	if err := g.Wait(); err != nil && eno == 0 {
+		eno = err.(syscall.Errno)
 	}
+
 	if eno == 0 && skipped > 0 {
 		attr.Nlink -= skipped
 		if eno := m.en.doRepair(ctx, ino, &attr); eno != 0 {
