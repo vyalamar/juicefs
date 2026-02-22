@@ -643,3 +643,13 @@ Targeted log:
   - Fault injects `WRONGTYPE` on `sliceRef` so batch `HINCRBY` fails.
   - `BatchClone` returns hard error (`EIO`), not `ENOTSUP`.
   - Destination entry and stat deltas are still written (`usedDelta=4096`, `inodeDelta=1`), confirming partial-write leakage risk on this failure path.
+
+### Known Limitations (Documented)
+
+- WATCH scope in Redis batch clone is inode/xattr keys, not chunk list keys:
+  - `pkg/meta/redis.go:5125` watches `i{srcIno}` / `x{srcIno}` and destination parent keys.
+  - Chunk lists are read by pipelined `LRANGE c{ino}_{idx}` (`pkg/meta/redis.go:5194`).
+- Implication:
+  - Concurrent writes/truncate usually mutate inode attrs and are caught by WATCH retry.
+  - Chunk-only maintenance mutations can still race and be cloned from a moving chunk view.
+- This is not unique to batch clone; old per-entry `doCloneEntry` uses the same watch scope (`pkg/meta/redis.go:5058`).

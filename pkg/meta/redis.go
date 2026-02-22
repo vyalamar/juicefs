@@ -3930,6 +3930,19 @@ func (m *redisMeta) scanPendingFiles(ctx Context, scan pendingFileScan) error {
 
 	visited := make(map[Ino]bool)
 	start := int64(0)
+	// Command budget rationale for batch size:
+	// Per source entry, read pipeline issues:
+	//   - 1x HGETALL xattr
+	//   - file: +Nchunk LRANGE, symlink: +1 GET
+	// Write TxPipelined issues:
+	//   - 1x SET inode + 1x HSET d{dstParent}
+	//   - optional 1x HMSET xattr
+	//   - file: +Nchunk RPUSH (non-empty chunks), symlink: +1 SET sym
+	// Plus batch-level counters/ref updates (INCRBY usedSpace/totalInodes and aggregated HINCRBY sliceRef).
+	//
+	// For the common case (regular files with one non-empty chunk and no xattr),
+	// this is roughly 2 read + 3 write (+~1 aggregated sliceRef) commands per entry.
+	// Keeping batches at 1000 bounds command/memory growth while still amortizing RTT.
 	const batchSize = 1000
 
 	for {
@@ -5127,6 +5140,10 @@ func (m *redisMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entr
 		for _, ino := range srcList {
 			watchKeys = append(watchKeys, m.inodeKey(ino), m.xattrKey(ino))
 		}
+		// Intentionally watch inode/xattr keys (same scope as doCloneEntry).
+		// Chunk list keys c{ino}_{idx} are read in pipeline but not watched here:
+		// regular writes/truncate usually touch inode attrs and trigger retry, while
+		// chunk-only maintenance updates can still race and be cloned from a moving view.
 
 		var batchLength, batchSpace, batchInodes int64
 		var batchQuotas []userGroupQuotaDelta
@@ -5173,6 +5190,9 @@ func (m *redisMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entr
 				srcData[srcList[i]] = &sourceData{attr: a}
 			}
 
+			// Read source payload using a single pipeline round-trip per sub-batch.
+			// Note this is not a frozen snapshot of chunk keys unless inode watch
+			// invalidates the transaction due to concurrent metadata changes.
 			readPipe := tx.Pipeline()
 			xcmds := make(map[Ino]*redis.MapStringStringCmd, len(srcList))
 			scmds := make(map[Ino]*redis.StringCmd)
